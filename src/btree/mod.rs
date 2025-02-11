@@ -1,4 +1,6 @@
 /*
+*   Node Header
+*
 *   OFFSET  SIZE    DESC
 *   0       1       type of node (internal: 0x00, leaf: 0x01)
 *   1       2       number of cells
@@ -6,13 +8,71 @@
 *   5       2       offset to first freeblock. 0x00 if none
 *   7       1       number of fragmented free bytes
 *   8       4       rightmost child page number
+*
+*   Cell struct
+*
+*   OFFSET  SIZE    DESC
+*   0       4       left child page number
+*   4       2       key len bytes (klen)
+*   6       2       value len bytes (vlen)
+*   8       klen    key
+*   8+klen  vlen    value
+*
+*   Freeblock struct
+*
+*   OFFSET  SIZE    DESC
+*   0       2       len bytes
+*   2       2       offset of next freeblock, 0x0000 if last
 */
+
+#![allow(dead_code, unused)]
+
+const HEADER_SIZE: usize = 12;
+
+// node header magic numbers
+const NODE_TYPE_OFFSET: usize = 0;
+const NODE_TYPE_SIZE: usize = 1;
+
+const NUM_CELLS_OFFSET: usize = 1;
+const NUM_CELLS_SIZE: usize = 2;
+
+const CELL_OFFSET_OFFSET: usize = 3;
+const CELL_OFFSET_SIZE: usize = 2;
+
+const FIRST_FREEBLOCK_OFFSET: usize = 5;
+const FIRST_FREEBLOCK_SIZE: usize = 2;
+
+const FRAGMENTED_BYTES_OFFSET: usize = 7;
+const FRAGMENTED_BYTES_SIZE: usize = 1;
+
+const RIGHTMOST_CHILD_OFFSET: usize = 8;
+const RIGHTMOST_CHILD_SIZE: usize = 4;
+
+// cell magic numbers
+const CELL_LEFT_CHILD_OFFSET: usize = 0;
+const CELL_LEFT_CHILD_SIZE: usize = 4;
+
+const CELL_KEY_LEN_OFFSET: usize = 4;
+const CELL_KEY_LEN_SIZE: usize = 2;
+
+const CELL_VALUE_LEN_OFFSET: usize = 6;
+const CELL_VALUE_LEN_SIZE: usize = 2;
+
+const CELL_KEY_OFFSET: usize = 8;
+
+// freeblock magic numbers
+const FREEBLOCK_LEN_OFFSET: usize = 0;
+const FREEBLOCK_LEN_SIZE: usize = 2;
+
+const FREEBLOCK_NEXT_OFFSET: usize = 0;
+const FREEBLOCK_NEXT_SIZE: usize = 0;
 
 mod errors;
 use errors::{BTreeError, InvalidHeaderError};
 
-pub struct BTreeNode {
-    data: Vec<u8>,
+pub struct BTreeNode<'a> {
+    data: &'a mut [u8],
+    page_size: usize,
 }
 
 enum NodeType {
@@ -20,19 +80,15 @@ enum NodeType {
     Leaf,
 }
 
-impl BTreeNode {
-    fn new(data: Vec<u8>) -> Result<Self, BTreeError> {
-        let node = Self { data };
+impl<'a> BTreeNode<'a> {
+    fn new(data: &'a mut [u8], page_size: usize) -> Result<Self, BTreeError> {
+        let node = Self { data, page_size };
         let node_type = node.node_type()?;
-        let required_len = match node_type {
-            NodeType::Internal => 12,
-            NodeType::Leaf => 8,
-        };
 
-        if node.data.len() < required_len {
+        if node.data.len() < HEADER_SIZE {
             return Err(BTreeError::InvalidHeader(
                 InvalidHeaderError::InsufficientData {
-                    expected: required_len,
+                    expected: HEADER_SIZE,
                     actual: node.data.len(),
                 },
             ));
@@ -71,6 +127,23 @@ impl BTreeNode {
         Ok(u32::from_be_bytes(self.get_bytes(8)?) as usize)
     }
 
+    fn free_space(&self) -> Result<usize, BTreeError> {
+        let fragmented_bytes = self.n_fragmented_bytes()?;
+        let unallocated_bytes = self.cell_offset()? - HEADER_SIZE;
+
+        let free_block_total = 0;
+        let next_free_block = self.first_freeblock_offset()?;
+        while next_free_block != 0 {
+            todo!()
+        }
+
+        Ok(fragmented_bytes + unallocated_bytes + free_block_total)
+    }
+
+    fn insert_cell(key: &[u8], value: &[u8]) {}
+
+    fn delete_cell(key: &[u8]) {}
+
     fn get_bytes<const N: usize>(&self, offset: usize) -> Result<[u8; N], BTreeError> {
         let end = offset + N;
         if end > self.data.len() {
@@ -84,7 +157,7 @@ impl BTreeNode {
 
         let bytes: [u8; N] = self.data[offset..end]
             .try_into()
-            .expect("This shouldn't fail because of the check above");
+            .expect("Unreachable. Everything is checked above");
         Ok(bytes)
     }
 
@@ -96,12 +169,15 @@ impl BTreeNode {
 
 #[cfg(test)]
 mod tests {
+    const PAGE_SIZE: usize = 4096;
     use super::*;
 
     #[test]
     fn get_node_type() -> Result<(), String> {
-        let data = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let node = BTreeNode::new(data).unwrap();
+        let mut data = vec![
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let node = BTreeNode::new(&mut data, PAGE_SIZE).unwrap();
         match node.node_type().unwrap() {
             NodeType::Leaf => Ok(()),
             NodeType::Internal => Err("This is not a leaf".to_string()),
