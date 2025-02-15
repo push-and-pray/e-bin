@@ -64,8 +64,8 @@ const CELL_KEY_OFFSET: usize = 8;
 const FREEBLOCK_LEN_OFFSET: usize = 0;
 const FREEBLOCK_LEN_SIZE: usize = 2;
 
-const FREEBLOCK_NEXT_OFFSET: usize = 0;
-const FREEBLOCK_NEXT_SIZE: usize = 0;
+const FREEBLOCK_NEXT_OFFSET: usize = 2;
+const FREEBLOCK_NEXT_SIZE: usize = 2;
 
 mod errors;
 use errors::{BTreeError, InvalidHeaderError};
