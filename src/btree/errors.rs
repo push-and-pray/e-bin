@@ -1,10 +1,12 @@
 #[derive(Debug)]
 pub enum BTreeError {
     InvalidHeader(InvalidHeaderError),
+    SerializationError(String),
+    UnexpectedData { expected: usize, actual: usize },
 }
 
 #[derive(Debug)]
 pub enum InvalidHeaderError {
     InvalidNodeType(u8),
-    InsufficientData { expected: usize, actual: usize },
+    UnexpectedData { expected: usize, actual: usize },
 }

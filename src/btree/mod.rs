@@ -1,64 +1,77 @@
 /*
 *   Node Header
-*
-*   OFFSET  SIZE    DESC
+*   OFFSET  LEN    DESC
 *   0       1       type of node (internal: 0x00, leaf: 0x01)
-*   1       2       number of cells
-*   3       2       offset to cells
-*   5       2       offset to first freeblock. 0x00 if none
-*   7       1       number of fragmented free bytes
-*   8       4       rightmost child page number
+*   1       2       number of keys
+*   3       2       free start offset
+*   5       2       free end offset
+*   7       2       offset to first freeblock. 0x00 if none
+*   9       1       number of fragmented free bytes
+*   10      4       rightmost child page number
+*   14      2       key bytes size (klen)
+*   16      +       key start
 *
-*   Cell struct
+*   Key struct
+*   OFFSET  LEN    DESC
+*   0       2       offset to value
+*   2       klen    key value
 *
-*   OFFSET  SIZE    DESC
+*   Value struct
+*   OFFSET  LEN    DESC
 *   0       4       left child page number
-*   4       2       key len bytes (klen)
-*   6       2       value len bytes (vlen)
-*   8       klen    key
-*   8+klen  vlen    value
+*   4       2       value len bytes (vlen)
+*   6       vlen    value
 *
 *   Freeblock struct
 *
-*   OFFSET  SIZE    DESC
+*   OFFSET  LEN    DESC
 *   0       2       len bytes
 *   2       2       offset of next freeblock, 0x0000 if last
 */
 
 #![allow(dead_code, unused)]
 
-const HEADER_SIZE: usize = 12;
-
 // node header magic numbers
 const NODE_TYPE_OFFSET: usize = 0;
-const NODE_TYPE_SIZE: usize = 1;
+const NODE_TYPE_LEN: usize = 1;
 
-const NUM_CELLS_OFFSET: usize = 1;
-const NUM_CELLS_SIZE: usize = 2;
+const NUM_KEYS_OFFSET: usize = 1;
+const NUM_KEYS_LEN: usize = 2;
 
-const CELL_OFFSET_OFFSET: usize = 3;
-const CELL_OFFSET_SIZE: usize = 2;
+const FREE_START_OFFSET: usize = 3;
+const FREE_START_LEN: usize = 2;
 
-const FIRST_FREEBLOCK_OFFSET: usize = 5;
-const FIRST_FREEBLOCK_SIZE: usize = 2;
+const FREE_END_OFFSET: usize = 5;
+const FREE_END_LEN: usize = 2;
 
-const FRAGMENTED_BYTES_OFFSET: usize = 7;
-const FRAGMENTED_BYTES_SIZE: usize = 1;
+const FIRST_FREEBLOCK_OFFSET: usize = 7;
+const FIRST_FREEBLOCK_LEN: usize = 2;
 
-const RIGHTMOST_CHILD_OFFSET: usize = 8;
-const RIGHTMOST_CHILD_SIZE: usize = 4;
+const FRAGMENTED_BYTES_OFFSET: usize = 9;
+const FRAGMENTED_BYTES_LEN: usize = 1;
 
-// cell magic numbers
-const CELL_LEFT_CHILD_OFFSET: usize = 0;
-const CELL_LEFT_CHILD_SIZE: usize = 4;
+const RIGHTMOST_CHILD_OFFSET: usize = 10;
+const RIGHTMOST_CHILD_LEN: usize = 4;
 
-const CELL_KEY_LEN_OFFSET: usize = 4;
-const CELL_KEY_LEN_SIZE: usize = 2;
+const KEY_LEN_OFFSET: usize = 14;
+const KEY_LEN_SIZE: usize = 2;
 
-const CELL_VALUE_LEN_OFFSET: usize = 6;
-const CELL_VALUE_LEN_SIZE: usize = 2;
+const HEADER_LEN: usize = 16;
 
-const CELL_KEY_OFFSET: usize = 8;
+// key struct magic numbers
+const KEY_OFFSET_TO_VAL_OFFSET: usize = 0;
+const KEY_OFFSET_TO_VAL_LEN: usize = 2;
+
+const KEY_HEADER_LEN: usize = 2;
+
+// value struct magic numbers
+const VALUE_LEFT_CHILD_OFFSET: usize = 0;
+const VALUE_LEFT_CHILD_LEN: usize = 4;
+
+const VALUE_LEN_OFFSET: usize = 4;
+const VALUE_LEN_LEN: usize = 2;
+
+const VALUE_HEADER_LEN: usize = 6;
 
 // freeblock magic numbers
 const FREEBLOCK_LEN_OFFSET: usize = 0;
@@ -70,23 +83,35 @@ const FREEBLOCK_NEXT_SIZE: usize = 2;
 mod errors;
 use errors::{BTreeError, InvalidHeaderError};
 
-pub struct BTreeNode<'a> {
+use bincode;
+use serde::{Deserialize, Serialize};
+
+pub struct BTreeNode<'a, K, V> {
     data: &'a mut [u8],
+    _marker: std::marker::PhantomData<(K, V)>,
 }
 
+#[derive(Debug)]
 enum NodeType {
     Internal,
     Leaf,
 }
 
-impl<'a> BTreeNode<'a> {
+impl<'a, K, V> BTreeNode<'a, K, V>
+where
+    K: Ord + Serialize + for<'de> Deserialize<'de>,
+    V: Serialize + for<'de> Deserialize<'de>,
+{
     fn new(data: &'a mut [u8]) -> Result<Self, BTreeError> {
-        let node = Self { data };
+        let node = Self {
+            data,
+            _marker: std::marker::PhantomData,
+        };
 
-        if node.data.len() < HEADER_SIZE {
+        if node.data.len() < HEADER_LEN {
             return Err(BTreeError::InvalidHeader(
-                InvalidHeaderError::InsufficientData {
-                    expected: HEADER_SIZE,
+                InvalidHeaderError::UnexpectedData {
+                    expected: HEADER_LEN,
                     actual: node.data.len(),
                 },
             ));
@@ -110,28 +135,38 @@ impl<'a> BTreeNode<'a> {
             NodeType::Internal => [0x00],
             NodeType::Leaf => [0x01],
         };
-        debug_assert_eq!(type_byte.len(), NODE_TYPE_SIZE);
+        debug_assert_eq!(type_byte.len(), NODE_TYPE_LEN);
         self.set_bytes(NODE_TYPE_OFFSET, &type_byte)
     }
 
-    fn get_n_cells(&self) -> Result<usize, BTreeError> {
-        Ok(u16::from_be_bytes(self.get_bytes(NUM_CELLS_OFFSET)?) as usize)
+    fn get_n_keys(&self) -> Result<usize, BTreeError> {
+        Ok(u16::from_be_bytes(self.get_bytes(NUM_KEYS_OFFSET)?) as usize)
     }
 
-    fn set_n_cells(&mut self, value: u16) -> Result<(), BTreeError> {
+    fn set_n_keys(&mut self, value: u16) -> Result<(), BTreeError> {
         let bytes = u16::to_be_bytes(value);
-        debug_assert_eq!(bytes.len(), NUM_CELLS_SIZE);
-        self.set_bytes(NUM_CELLS_OFFSET, &bytes)
+        debug_assert_eq!(bytes.len(), NUM_KEYS_LEN);
+        self.set_bytes(NUM_KEYS_OFFSET, &bytes)
     }
 
-    fn get_cell_offset(&self) -> Result<usize, BTreeError> {
-        Ok(u16::from_be_bytes(self.get_bytes(CELL_OFFSET_OFFSET)?) as usize)
+    fn get_free_start(&self) -> Result<usize, BTreeError> {
+        Ok(u16::from_be_bytes(self.get_bytes(FREE_START_OFFSET)?) as usize)
     }
 
-    fn set_cell_offset(&mut self, value: u16) -> Result<(), BTreeError> {
+    fn set_free_start(&mut self, value: u16) -> Result<(), BTreeError> {
         let bytes = u16::to_be_bytes(value);
-        debug_assert_eq!(bytes.len(), CELL_OFFSET_SIZE);
-        self.set_bytes(CELL_OFFSET_OFFSET, &bytes)
+        debug_assert_eq!(bytes.len(), FREE_START_LEN);
+        self.set_bytes(FREE_START_OFFSET, &bytes)
+    }
+
+    fn get_free_end(&self) -> Result<usize, BTreeError> {
+        Ok(u16::from_be_bytes(self.get_bytes(FREE_END_OFFSET)?) as usize)
+    }
+
+    fn set_free_end(&mut self, value: u16) -> Result<(), BTreeError> {
+        let bytes = u16::to_be_bytes(value);
+        debug_assert_eq!(bytes.len(), FREE_END_LEN);
+        self.set_bytes(FREE_END_OFFSET, &bytes)
     }
 
     fn get_first_freeblock_offset(&self) -> Result<usize, BTreeError> {
@@ -140,7 +175,7 @@ impl<'a> BTreeNode<'a> {
 
     fn set_first_freeblock_offset(&mut self, value: u16) -> Result<(), BTreeError> {
         let bytes = u16::to_be_bytes(value);
-        debug_assert_eq!(bytes.len(), FIRST_FREEBLOCK_SIZE);
+        debug_assert_eq!(bytes.len(), FIRST_FREEBLOCK_LEN);
         self.set_bytes(FIRST_FREEBLOCK_OFFSET, &bytes)
     }
 
@@ -150,7 +185,7 @@ impl<'a> BTreeNode<'a> {
 
     fn set_n_fragmented_bytes(&mut self, value: u8) -> Result<(), BTreeError> {
         let bytes = u8::to_be_bytes(value);
-        debug_assert_eq!(bytes.len(), FRAGMENTED_BYTES_SIZE);
+        debug_assert_eq!(bytes.len(), FRAGMENTED_BYTES_LEN);
         self.set_bytes(FRAGMENTED_BYTES_OFFSET, &bytes)
     }
 
@@ -160,28 +195,64 @@ impl<'a> BTreeNode<'a> {
 
     fn set_rightmost_child(&mut self, value: u32) -> Result<(), BTreeError> {
         let bytes = u32::to_be_bytes(value);
-        debug_assert_eq!(bytes.len(), RIGHTMOST_CHILD_SIZE);
+        debug_assert_eq!(bytes.len(), RIGHTMOST_CHILD_LEN);
         self.set_bytes(RIGHTMOST_CHILD_OFFSET, &bytes)
+    }
+
+    fn get_key_len(&self) -> Result<usize, BTreeError> {
+        Ok(u16::from_be_bytes(self.get_bytes(KEY_LEN_OFFSET)?) as usize)
+    }
+
+    fn set_key_len(&mut self, value: u16) -> Result<(), BTreeError> {
+        let bytes = u16::to_be_bytes(value);
+        debug_assert_eq!(bytes.len(), KEY_LEN_SIZE);
+        self.set_bytes(KEY_LEN_OFFSET, &bytes)
     }
 
     fn free_space(&self) -> Result<usize, BTreeError> {
         let fragmented_bytes = self.get_n_fragmented_bytes()?;
-        let unallocated_bytes = self.get_cell_offset()? - HEADER_SIZE;
+        let unallocated_bytes = self.unallocated_space()?;
 
         let mut free_block_total = 0;
         let mut next_free_block = self.get_first_freeblock_offset()?;
 
         while next_free_block != 0 {
             free_block_total +=
-                usize::from_be_bytes(self.get_bytes(next_free_block + FREEBLOCK_LEN_OFFSET)?);
+                u16::from_be_bytes(self.get_bytes(next_free_block + FREEBLOCK_LEN_OFFSET)?)
+                    as usize;
             next_free_block =
-                usize::from_be_bytes(self.get_bytes(next_free_block + FREEBLOCK_NEXT_OFFSET)?);
+                u16::from_be_bytes(self.get_bytes(next_free_block + FREEBLOCK_NEXT_OFFSET)?)
+                    as usize;
         }
 
         Ok(fragmented_bytes + unallocated_bytes + free_block_total)
     }
 
-    fn insert_cell(key: &[u8], value: &[u8]) {}
+    fn unallocated_space(&self) -> Result<usize, BTreeError> {
+        Ok(self.get_free_end()? - self.get_free_start()?)
+    }
+
+    fn insert_cell(&mut self, key: K, value: V) -> Result<(), BTreeError> {
+        todo!();
+        let key_bytes =
+            bincode::serialize(&key).map_err(|e| BTreeError::SerializationError(e.to_string()))?;
+        if key_bytes.len() != self.get_key_len()? {
+            return Err(BTreeError::UnexpectedData {
+                expected: self.get_key_len()?,
+                actual: key_bytes.len(),
+            });
+        }
+        let value_bytes = bincode::serialize(&value)
+            .map_err(|e| BTreeError::SerializationError(e.to_string()))?;
+
+        let required_space =
+            key_bytes.len() + value_bytes.len() + KEY_HEADER_LEN + VALUE_HEADER_LEN;
+
+        if required_space < self.unallocated_space() {
+            todo!("Handle space missing in");
+        }
+
+    }
 
     fn delete_cell(key: &[u8]) {}
 
@@ -194,7 +265,7 @@ impl<'a> BTreeNode<'a> {
         let end = offset + N;
         if end > self.data.len() {
             return Err(BTreeError::InvalidHeader(
-                InvalidHeaderError::InsufficientData {
+                InvalidHeaderError::UnexpectedData {
                     expected: end,
                     actual: self.data.len(),
                 },
@@ -222,8 +293,8 @@ mod tests {
 
     #[test]
     fn test_invalid_header_insufficient_data() {
-        let mut data = vec![0u8; HEADER_SIZE - 1];
-        let result = BTreeNode::new(&mut data);
+        let mut data = vec![0u8; HEADER_LEN - 1];
+        let result = BTreeNode::<i32, String>::new(&mut data);
         assert!(
             result.is_err(),
             "Expected error for insufficient header data"
@@ -231,61 +302,88 @@ mod tests {
     }
 
     #[test]
-    fn get_node_type() -> Result<(), String> {
-        let mut data = vec![
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let node = BTreeNode::new(&mut data).unwrap();
+    fn node_type() -> Result<(), String> {
+        let mut data = vec![0x00; PAGE_SIZE];
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
+
+        node.set_node_type(NodeType::Leaf).unwrap();
         match node.get_node_type().unwrap() {
             NodeType::Leaf => Ok(()),
-            NodeType::Internal => Err("This is not a leaf".to_string()),
-        }
+            _ => Err("Read error"),
+        };
+
+        node.set_node_type(NodeType::Internal).unwrap();
+        match node.get_node_type().unwrap() {
+            NodeType::Internal => Ok(()),
+            _ => Err("Read error"),
+        };
+
+        Ok(())
     }
 
     #[test]
     fn num_cells() -> Result<(), String> {
         let mut data = vec![0x00; PAGE_SIZE];
-        let mut node = BTreeNode::new(&mut data).unwrap();
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
 
-        node.set_n_cells(1);
-        assert_eq!(node.get_n_cells().unwrap(), 1);
+        node.set_n_keys(1);
+        assert_eq!(node.get_n_keys().unwrap(), 1);
 
-        node.set_n_cells(10);
-        assert_eq!(node.get_n_cells().unwrap(), 10);
+        node.set_n_keys(10);
+        assert_eq!(node.get_n_keys().unwrap(), 10);
 
-        node.set_n_cells(0);
-        assert_eq!(node.get_n_cells().unwrap(), 0);
+        node.set_n_keys(0);
+        assert_eq!(node.get_n_keys().unwrap(), 0);
 
-        node.set_n_cells(65535);
-        assert_eq!(node.get_n_cells().unwrap(), 65535);
+        node.set_n_keys(65535);
+        assert_eq!(node.get_n_keys().unwrap(), 65535);
 
         Ok(())
     }
 
     #[test]
-    fn cell_offset() -> Result<(), String> {
+    fn free_start() -> Result<(), String> {
         let mut data = vec![0x00; PAGE_SIZE];
-        let mut node = BTreeNode::new(&mut data).unwrap();
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
 
-        node.set_cell_offset(1);
-        assert_eq!(node.get_cell_offset().unwrap(), 1);
+        node.set_free_start(1);
+        assert_eq!(node.get_free_start().unwrap(), 1);
 
-        node.set_cell_offset(10);
-        assert_eq!(node.get_cell_offset().unwrap(), 10);
+        node.set_free_start(10);
+        assert_eq!(node.get_free_start().unwrap(), 10);
 
-        node.set_cell_offset(0);
-        assert_eq!(node.get_cell_offset().unwrap(), 0);
+        node.set_free_start(0);
+        assert_eq!(node.get_free_start().unwrap(), 0);
 
-        node.set_cell_offset(65535);
-        assert_eq!(node.get_cell_offset().unwrap(), 65535);
+        node.set_free_start(65535);
+        assert_eq!(node.get_free_start().unwrap(), 65535);
 
         Ok(())
     }
 
+    #[test]
+    fn free_end() -> Result<(), String> {
+        let mut data = vec![0x00; PAGE_SIZE];
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
+
+        node.set_free_end(1);
+        assert_eq!(node.get_free_end().unwrap(), 1);
+
+        node.set_free_end(10);
+        assert_eq!(node.get_free_end().unwrap(), 10);
+
+        node.set_free_end(0);
+        assert_eq!(node.get_free_end().unwrap(), 0);
+
+        node.set_free_end(65535);
+        assert_eq!(node.get_free_end().unwrap(), 65535);
+
+        Ok(())
+    }
     #[test]
     fn first_freeblock_offset() -> Result<(), String> {
         let mut data = vec![0x00; PAGE_SIZE];
-        let mut node = BTreeNode::new(&mut data).unwrap();
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
 
         node.set_first_freeblock_offset(1);
         assert_eq!(node.get_first_freeblock_offset().unwrap(), 1);
@@ -305,7 +403,7 @@ mod tests {
     #[test]
     fn n_fragmented_bytes() -> Result<(), String> {
         let mut data = vec![0x00; PAGE_SIZE];
-        let mut node = BTreeNode::new(&mut data).unwrap();
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
 
         node.set_n_fragmented_bytes(1);
         assert_eq!(node.get_n_fragmented_bytes().unwrap(), 1);
@@ -325,7 +423,7 @@ mod tests {
     #[test]
     fn rightmost_child() -> Result<(), String> {
         let mut data = vec![0x00; PAGE_SIZE];
-        let mut node = BTreeNode::new(&mut data).unwrap();
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
 
         node.set_rightmost_child(1);
         assert_eq!(node.get_rightmost_child().unwrap(), 1);
@@ -339,6 +437,55 @@ mod tests {
         node.set_rightmost_child(65535);
         assert_eq!(node.get_rightmost_child().unwrap(), 65535);
 
+        Ok(())
+    }
+
+    #[test]
+    fn key_len() -> Result<(), String> {
+        let mut data = vec![0x00; PAGE_SIZE];
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
+
+        node.set_key_len(1);
+        assert_eq!(node.get_key_len().unwrap(), 1);
+
+        node.set_key_len(10);
+        assert_eq!(node.get_key_len().unwrap(), 10);
+
+        node.set_key_len(0);
+        assert_eq!(node.get_key_len().unwrap(), 0);
+
+        node.set_key_len(65535);
+        assert_eq!(node.get_key_len().unwrap(), 65535);
+
+        Ok(())
+    }
+
+    #[test]
+    fn all_header_properties() -> Result<(), String> {
+        let mut data = vec![0x00; PAGE_SIZE];
+        let mut node = BTreeNode::<i32, String>::new(&mut data).unwrap();
+
+        node.set_node_type(NodeType::Leaf).unwrap();
+
+        node.set_n_keys(65535);
+        node.set_free_start(65534);
+        node.set_free_end(65533);
+        node.set_first_freeblock_offset(65532);
+        node.set_n_fragmented_bytes(200);
+        node.set_rightmost_child(65521);
+        node.set_key_len(64535);
+
+        match node.get_node_type().unwrap() {
+            NodeType::Leaf => Ok(()),
+            _ => Err("Read error"),
+        };
+        assert_eq!(node.get_n_keys().unwrap(), 65535);
+        assert_eq!(node.get_free_start().unwrap(), 65534);
+        assert_eq!(node.get_free_end().unwrap(), 65533);
+        assert_eq!(node.get_first_freeblock_offset().unwrap(), 65532);
+        assert_eq!(node.get_n_fragmented_bytes().unwrap(), 200);
+        assert_eq!(node.get_rightmost_child().unwrap(), 65521);
+        assert_eq!(node.get_key_len().unwrap(), 64535);
         Ok(())
     }
 }
