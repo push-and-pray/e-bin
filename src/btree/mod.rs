@@ -1,6 +1,6 @@
 use errors::BTreeError;
 use zerocopy::byteorder::little_endian::{U16, U32};
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unalign};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 pub mod errors;
 
@@ -28,11 +28,8 @@ const HEADER_SIZE: usize = size_of::<Header>();
 
 #[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable)]
 #[repr(C)]
-struct Key<K>
-where
-    K: Ord,
-{
-    value: Unalign<K>,
+struct Key {
+    value: U32,
     left_child_page: U32,
     offset: U16,
 }
@@ -59,15 +56,11 @@ impl Header {
     }
 }
 
-pub struct Node<K>
-where
-    K: Ord,
-{
+pub struct Node {
     pub data: [u8; PAGE_SIZE],
-    _marker: std::marker::PhantomData<K>,
 }
 
-impl<K: Ord> Node<K> {
+impl Node {
     pub fn new() -> Self {
         let header = Header::new(
             NodeType::Leaf,
@@ -81,10 +74,7 @@ impl<K: Ord> Node<K> {
         let header_bytes = header.as_bytes();
         let mut data = [0x00; PAGE_SIZE];
         data[0..HEADER_SIZE].copy_from_slice(header_bytes);
-        Node {
-            data,
-            _marker: std::marker::PhantomData,
-        }
+        Node { data }
     }
 
     pub fn read_header(&self) -> Result<&Header, BTreeError> {
@@ -103,7 +93,7 @@ impl<K: Ord> Node<K> {
     }
 }
 
-impl<K: Ord> Default for Node<K> {
+impl Default for Node {
     fn default() -> Self {
         Node::new()
     }
@@ -115,7 +105,7 @@ mod tests {
 
     #[test]
     fn mutate_and_read_header() -> Result<(), BTreeError> {
-        let mut node = Node::<i32>::new();
+        let mut node = Node::new();
 
         {
             let header_mut = node.mutate_header()?;
