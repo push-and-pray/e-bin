@@ -1,35 +1,5 @@
-/*
-*   Node Header
-*   OFFSET  LEN    DESC
-*   0       1       type of node (internal: 0x00, leaf: 0x01)
-*   1       2       number of keys
-*   3       2       free start offset
-*   5       2       free end offset
-*   7       2       offset to first freeblock. 0x00 if none
-*   9       1       number of fragmented free bytes
-*   10      4       rightmost child page number
-*   14      2       key bytes size (klen)
-*   16      +       key start
-*
-*   Key struct
-*   OFFSET  LEN    DESC
-*   0       2       offset to value
-*   2       klen    key value
-*
-*   Value struct
-*   OFFSET  LEN    DESC
-*   0       4       left child page number
-*   4       2       value len bytes (vlen)
-*   6       vlen    value
-*
-*   Freeblock struct
-*
-*   OFFSET  LEN    DESC
-*   0       2       len bytes
-*   2       2       offset of next freeblock, 0x0000 if last
-*/
-
-use errors::{BTreeError, InvalidHeaderError};
+use errors::BTreeError;
+use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unalign};
 
 pub mod errors;
@@ -37,7 +7,7 @@ pub mod errors;
 const PAGE_SIZE: usize = 64;
 
 #[repr(u8)]
-#[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable)]
+#[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq)]
 pub enum NodeType {
     Internal,
     Leaf,
@@ -46,20 +16,25 @@ pub enum NodeType {
 #[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Header {
-    pub node_type: Unalign<NodeType>,
-    pub num_keys: Unalign<u16>,
-    pub free_start: Unalign<u16>,
-    pub free_end: Unalign<u16>,
-    pub first_freeblock: Unalign<u16>,
-    pub fragmented_bytes: Unalign<u8>,
-    pub rightmost_child_page: Unalign<u32>,
+    pub node_type: NodeType,
+    pub num_keys: U16,
+    pub free_start: U16,
+    pub free_end: U16,
+    pub first_freeblock: U16,
+    pub fragmented_bytes: u8,
+    pub rightmost_child_page: U32,
 }
 const HEADER_SIZE: usize = size_of::<Header>();
 
-struct Key {
-    value: u16,
-    left_child_page: u32,
-    offset: u16,
+#[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+struct Key<K>
+where
+    K: Ord,
+{
+    value: Unalign<K>,
+    left_child_page: U32,
+    offset: U16,
 }
 
 impl Header {
@@ -73,22 +48,26 @@ impl Header {
         rightmost_child_page: u32,
     ) -> Self {
         Header {
-            node_type: Unalign::new(node_type),
-            num_keys: Unalign::new(num_keys),
-            free_start: Unalign::new(free_start),
-            free_end: Unalign::new(free_end),
-            first_freeblock: Unalign::new(first_freeblock),
-            fragmented_bytes: Unalign::new(fragmented_bytes),
-            rightmost_child_page: Unalign::new(rightmost_child_page),
+            node_type,
+            num_keys: U16::new(num_keys),
+            free_start: U16::new(free_start),
+            free_end: U16::new(free_end),
+            first_freeblock: U16::new(first_freeblock),
+            fragmented_bytes,
+            rightmost_child_page: U32::new(rightmost_child_page),
         }
     }
 }
 
-pub struct Node {
+pub struct Node<K>
+where
+    K: Ord,
+{
     pub data: [u8; PAGE_SIZE],
+    _marker: std::marker::PhantomData<K>,
 }
 
-impl Node {
+impl<K: Ord> Node<K> {
     pub fn new() -> Self {
         let header = Header::new(
             NodeType::Leaf,
@@ -102,7 +81,10 @@ impl Node {
         let header_bytes = header.as_bytes();
         let mut data = [0x00; PAGE_SIZE];
         data[0..HEADER_SIZE].copy_from_slice(header_bytes);
-        Node { data }
+        Node {
+            data,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     pub fn read_header(&self) -> Result<&Header, BTreeError> {
@@ -114,10 +96,48 @@ impl Node {
         Header::try_mut_from_bytes(&mut self.data[0..HEADER_SIZE])
             .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
+
+    pub fn unallocated_space(&self) -> Result<usize, BTreeError> {
+        let header = self.read_header()?;
+        Ok((header.free_end.get() - header.free_start.get()) as usize)
+    }
 }
 
-impl Default for Node {
+impl<K: Ord> Default for Node<K> {
     fn default() -> Self {
         Node::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutate_and_read_header() -> Result<(), BTreeError> {
+        let mut node = Node::<i32>::new();
+
+        {
+            let header_mut = node.mutate_header()?;
+            header_mut.node_type = NodeType::Internal;
+            header_mut.num_keys.set(42);
+            header_mut.free_start.set(10);
+            header_mut.free_end.set(54);
+            header_mut.first_freeblock.set(5);
+            header_mut.fragmented_bytes = 2;
+            header_mut.rightmost_child_page.set(1234);
+        }
+
+        let header = node.read_header()?;
+
+        assert_eq!(header.node_type, NodeType::Internal);
+        assert_eq!(header.num_keys.get(), 42);
+        assert_eq!(header.free_start.get(), 10);
+        assert_eq!(header.free_end.get(), 54);
+        assert_eq!(header.first_freeblock.get(), 5);
+        assert_eq!(header.fragmented_bytes, 2);
+        assert_eq!(header.rightmost_child_page.get(), 1234);
+
+        Ok(())
     }
 }
