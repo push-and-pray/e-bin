@@ -134,7 +134,7 @@ impl<'a> Node<'a> {
             actual: value.len(),
         })?;
 
-        if self.unallocated_space()? < KEY_SIZE as usize + value_len as usize {
+        if self.unallocated_space()? < (KEY_SIZE + value_len).into() {
             todo!("Handle overflow");
         }
 
@@ -159,34 +159,46 @@ impl<'a> Node<'a> {
         Ok(())
     }
 
-    pub fn find_key(&self, key: u64) -> Result<Option<&Key>, BTreeError> {
-        let mut key_cursor = HEADER_SIZE as usize;
-        let mut found_key = None;
-        while key_cursor < self.read_header()?.free_start.into() {
-            let key_obj =
-                Key::ref_from_bytes(&self.page[key_cursor..key_cursor + KEY_SIZE as usize])
-                    .map_err(|err| BTreeError::SerializationError(err.to_string()))?;
-            if key_obj.key.get() == key {
-                found_key = Some(key_obj);
-                break;
-            }
+    /// Returns lowest index where key < other_key is true through binary search.
+    fn find_le_key(&self, key: u64) -> Result<(usize, bool), BTreeError> {
+        let header = self.read_header()?;
+        let num_keys = header.num_keys.get();
 
-            key_cursor += KEY_SIZE as usize;
+        if num_keys == 0 {
+            return Ok((0, false));
         }
 
-        Ok(found_key)
+        let mut low = 0;
+        let mut high = num_keys;
+
+        while low < high {
+            let mid = (low + high) / 2;
+            let current_key = self.get_key_at(mid)?.key.get();
+
+            // https://github.com/rust-lang/rust-clippy/issues/5354
+            #[allow(clippy::comparison_chain)]
+            if current_key == key {
+                return Ok((mid.into(), true));
+            } else if current_key < key {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        Ok((low.into(), false))
     }
 
-    pub fn find_value(&self, key: u64) -> Result<Option<&[u8]>, BTreeError> {
-        let key_ref = self.find_key(key)?;
+    fn get_key_at(&self, index: u16) -> Result<&Key, BTreeError> {
+        let key_pos = (HEADER_SIZE + KEY_SIZE * index) as usize;
+        Key::ref_from_bytes(&self.page[key_pos..(key_pos + KEY_SIZE as usize)])
+            .map_err(|err| BTreeError::SerializationError(err.to_string()))
+    }
 
-        match key_ref {
-            None => Ok(None),
-            Some(k) => Ok(Some(
-                &self.page[usize::from(k.value_offset)
-                    ..usize::from(k.value_offset) + usize::from(k.value_len)],
-            )),
-        }
+    fn get_mut_key_at(&mut self, index: u16) -> Result<&mut Key, BTreeError> {
+        let key_pos = (HEADER_SIZE + KEY_SIZE * index) as usize;
+        Key::mut_from_bytes(&mut self.page[key_pos..(key_pos + KEY_SIZE as usize)])
+            .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
 }
 
@@ -224,19 +236,23 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get() -> Result<(), BTreeError> {
+    fn find_le_key() -> Result<(), BTreeError> {
         let mut page = [0x00; PAGE_SIZE as usize];
         let mut node = Node::new(&mut page)?;
 
-        node.insert(0, b"0000")?;
         node.insert(1, b"111")?;
-        node.insert(2, b"22")?;
-        node.insert(3, b"3")?;
+        node.insert(4, b"444444")?;
+        node.insert(6, b"66")?;
 
-        assert_eq!(node.find_value(0)?.unwrap(), b"0000");
-        assert_eq!(node.find_value(1)?.unwrap(), b"111");
-        assert_eq!(node.find_value(2)?.unwrap(), b"22");
-        assert_eq!(node.find_value(3)?.unwrap(), b"3");
+        assert_eq!(node.find_le_key(1)?, (0, true));
+        assert_eq!(node.find_le_key(4)?, (1, true));
+        assert_eq!(node.find_le_key(6)?, (2, true));
+
+        assert_eq!(node.find_le_key(0)?, (0, false));
+        assert_eq!(node.find_le_key(2)?, (1, false));
+        assert_eq!(node.find_le_key(3)?, (1, false));
+        assert_eq!(node.find_le_key(5)?, (2, false));
+        assert_eq!(node.find_le_key(7)?, (3, false));
 
         Ok(())
     }
