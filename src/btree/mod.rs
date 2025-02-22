@@ -35,7 +35,7 @@ const HEADER_SIZE: u16 = {
 #[derive(Debug, KnownLayout, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Key {
-    data: U64,
+    key: U64,
     left_child_page: U32,
     value_offset: U16,
     value_len: U16,
@@ -48,9 +48,9 @@ const KEY_SIZE: u16 = {
 };
 
 impl Key {
-    fn new(data: u64, left_child_page: u32, value_offset: u16, value_len: u16) -> Self {
+    fn new(key: u64, left_child_page: u32, value_offset: u16, value_len: u16) -> Self {
         Self {
-            data: data.into(),
+            key: key.into(),
             left_child_page: left_child_page.into(),
             value_offset: value_offset.into(),
             value_len: value_len.into(),
@@ -87,19 +87,19 @@ impl Header {
 }
 
 pub struct Node<'a> {
-    data: &'a mut [u8],
+    page: &'a mut [u8],
 }
 
 impl<'a> Node<'a> {
-    pub fn new(data: &'a mut [u8]) -> Result<Self, BTreeError> {
-        if data.len() != PAGE_SIZE.into() {
+    pub fn new(page: &'a mut [u8]) -> Result<Self, BTreeError> {
+        if page.len() != PAGE_SIZE.into() {
             return Err(BTreeError::UnexpectedData {
                 expected: PAGE_SIZE.into(),
-                actual: data.len(),
+                actual: page.len(),
             });
         }
 
-        let mut node = Self { data };
+        let mut node = Self { page };
 
         let header = node.mutate_header()?;
         header.node_type = NodeType::Leaf;
@@ -114,12 +114,12 @@ impl<'a> Node<'a> {
     }
 
     fn read_header(&self) -> Result<&Header, BTreeError> {
-        Header::try_ref_from_bytes(&self.data[0..HEADER_SIZE as usize])
+        Header::try_ref_from_bytes(&self.page[0..HEADER_SIZE as usize])
             .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
 
     fn mutate_header(&mut self) -> Result<&mut Header, BTreeError> {
-        Header::try_mut_from_bytes(&mut self.data[0..HEADER_SIZE as usize])
+        Header::try_mut_from_bytes(&mut self.page[0..HEADER_SIZE as usize])
             .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
 
@@ -144,13 +144,13 @@ impl<'a> Node<'a> {
             header.free_end.get() as usize
         };
 
-        self.data[new_free_end..new_free_end + value.len()].copy_from_slice(value);
+        self.page[new_free_end..new_free_end + value.len()].copy_from_slice(value);
 
         let free_start: usize = self.read_header()?.free_start.get().into();
 
         let new_key = Key::new(key, 0, new_free_end as u16, value_len);
         let key_bytes = new_key.as_bytes();
-        self.data[free_start..free_start + KEY_SIZE as usize].copy_from_slice(key_bytes);
+        self.page[free_start..free_start + KEY_SIZE as usize].copy_from_slice(key_bytes);
 
         let header = self.mutate_header()?;
         header.free_start += KEY_SIZE;
@@ -164,9 +164,9 @@ impl<'a> Node<'a> {
         let mut found_key = None;
         while key_cursor < self.read_header()?.free_start.into() {
             let key_obj =
-                Key::ref_from_bytes(&self.data[key_cursor..key_cursor + KEY_SIZE as usize])
+                Key::ref_from_bytes(&self.page[key_cursor..key_cursor + KEY_SIZE as usize])
                     .map_err(|err| BTreeError::SerializationError(err.to_string()))?;
-            if key_obj.data.get() == key {
+            if key_obj.key.get() == key {
                 found_key = Some(key_obj);
                 break;
             }
@@ -183,7 +183,7 @@ impl<'a> Node<'a> {
         match key_ref {
             None => Ok(None),
             Some(k) => Ok(Some(
-                &self.data[usize::from(k.value_offset)
+                &self.page[usize::from(k.value_offset)
                     ..usize::from(k.value_offset) + usize::from(k.value_len)],
             )),
         }
