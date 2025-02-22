@@ -1,13 +1,13 @@
 use errors::BTreeError;
-use zerocopy::byteorder::little_endian::{U16, U32};
+use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 pub mod errors;
 
-const PAGE_SIZE: usize = 4096;
+const PAGE_SIZE: u16 = 4096;
 
+#[derive(Debug, PartialEq, KnownLayout, TryFromBytes, IntoBytes, Immutable)]
 #[repr(u8)]
-#[derive(KnownLayout, TryFromBytes, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq)]
 pub enum NodeType {
     Internal,
     Leaf,
@@ -24,17 +24,45 @@ pub struct Header {
     pub fragmented_bytes: u8,
     pub rightmost_child_page: U32,
 }
-const HEADER_SIZE: usize = size_of::<Header>();
+
+const HEADER_SIZE: u16 = {
+    if size_of::<Header>() > u16::MAX as usize {
+        panic!("Header size does not fit into u16");
+    }
+    size_of::<Header>() as u16
+};
 
 #[derive(Debug, KnownLayout, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Key {
-    value: U32,
+    data: U64,
     left_child_page: U32,
-    offset: U16,
-    len: U16,
+    value_offset: U16,
+    value_len: U16,
 }
-const KEY_SIZE: usize = size_of::<Key>();
+const KEY_SIZE: u16 = {
+    if size_of::<Key>() > u16::MAX as usize {
+        panic!("Key size does not fit into u16");
+    }
+    size_of::<Key>() as u16
+};
+
+impl Key {
+    fn new(data: u64, left_child_page: u32, value_offset: u16, value_len: u16) -> Self {
+        Self {
+            data: data.into(),
+            left_child_page: left_child_page.into(),
+            value_offset: value_offset.into(),
+            value_len: value_len.into(),
+        }
+    }
+}
+
+#[derive(FromBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct Value {
+    data: [u8],
+}
 
 impl Header {
     pub fn new(
@@ -58,34 +86,40 @@ impl Header {
     }
 }
 
-pub struct Node {
-    data: [u8; PAGE_SIZE],
+pub struct Node<'a> {
+    data: &'a mut [u8],
 }
 
-impl Node {
-    pub fn new() -> Self {
-        let header = Header::new(
-            NodeType::Leaf,
-            0,
-            HEADER_SIZE.try_into().unwrap(),
-            PAGE_SIZE.try_into().unwrap(),
-            0,
-            0,
-            0,
-        );
-        let header_bytes = header.as_bytes();
-        let mut data = [0x00; PAGE_SIZE];
-        data[0..HEADER_SIZE].copy_from_slice(header_bytes);
-        Node { data }
+impl<'a> Node<'a> {
+    pub fn new(data: &'a mut [u8]) -> Result<Self, BTreeError> {
+        if data.len() != PAGE_SIZE.into() {
+            return Err(BTreeError::UnexpectedData {
+                expected: PAGE_SIZE.into(),
+                actual: data.len(),
+            });
+        }
+
+        let mut node = Self { data };
+
+        let header = node.mutate_header()?;
+        header.node_type = NodeType::Leaf;
+        header.num_keys = 0.into();
+        header.free_start = HEADER_SIZE.into();
+        header.free_end = PAGE_SIZE.into();
+        header.first_freeblock = 0.into();
+        header.fragmented_bytes = 0;
+        header.rightmost_child_page = 0.into();
+
+        Ok(node)
     }
 
     fn read_header(&self) -> Result<&Header, BTreeError> {
-        Header::try_ref_from_bytes(&self.data[0..HEADER_SIZE])
+        Header::try_ref_from_bytes(&self.data[0..HEADER_SIZE as usize])
             .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
 
     fn mutate_header(&mut self) -> Result<&mut Header, BTreeError> {
-        Header::try_mut_from_bytes(&mut self.data[0..HEADER_SIZE])
+        Header::try_mut_from_bytes(&mut self.data[0..HEADER_SIZE as usize])
             .map_err(|err| BTreeError::SerializationError(err.to_string()))
     }
 
@@ -94,13 +128,13 @@ impl Node {
         Ok((header.free_end.get() - header.free_start.get()) as usize)
     }
 
-    pub fn insert(&mut self, key: u32, value: &[u8]) -> Result<(), BTreeError> {
+    pub fn insert(&mut self, key: u64, value: &[u8]) -> Result<(), BTreeError> {
         let value_len = u16::try_from(value.len()).map_err(|_| BTreeError::UnexpectedData {
             expected: 65535,
             actual: value.len(),
         })?;
 
-        if self.unallocated_space()? < KEY_SIZE + value_len as usize {
+        if self.unallocated_space()? < KEY_SIZE as usize + value_len as usize {
             todo!("Handle overflow");
         }
 
@@ -114,54 +148,45 @@ impl Node {
 
         let free_start: usize = self.read_header()?.free_start.get().into();
 
-        let new_key = Key {
-            value: key.into(),
-            left_child_page: 0.into(),
-            offset: (new_free_end as u16).into(),
-            len: value_len.into(),
-        };
+        let new_key = Key::new(key, 0, new_free_end as u16, value_len);
         let key_bytes = new_key.as_bytes();
-        self.data[free_start..free_start + KEY_SIZE].copy_from_slice(key_bytes);
+        self.data[free_start..free_start + KEY_SIZE as usize].copy_from_slice(key_bytes);
 
         let header = self.mutate_header()?;
-        header.free_start += KEY_SIZE as u16;
+        header.free_start += KEY_SIZE;
         header.num_keys += 1;
 
         Ok(())
     }
 
-    pub fn find_key(&self, key: u32) -> Result<Option<&Key>, BTreeError> {
-        let mut key_cursor = HEADER_SIZE;
+    pub fn find_key(&self, key: u64) -> Result<Option<&Key>, BTreeError> {
+        let mut key_cursor = HEADER_SIZE as usize;
         let mut found_key = None;
         while key_cursor < self.read_header()?.free_start.into() {
-            let key_obj = Key::ref_from_bytes(&self.data[key_cursor..key_cursor + KEY_SIZE])
-                .map_err(|err| BTreeError::SerializationError(err.to_string()))?;
-            if key_obj.value.get() == key {
+            let key_obj =
+                Key::ref_from_bytes(&self.data[key_cursor..key_cursor + KEY_SIZE as usize])
+                    .map_err(|err| BTreeError::SerializationError(err.to_string()))?;
+            if key_obj.data.get() == key {
                 found_key = Some(key_obj);
                 break;
             }
 
-            key_cursor += KEY_SIZE;
+            key_cursor += KEY_SIZE as usize;
         }
 
         Ok(found_key)
     }
 
-    pub fn find_value(&self, key: u32) -> Result<Option<&[u8]>, BTreeError> {
+    pub fn find_value(&self, key: u64) -> Result<Option<&[u8]>, BTreeError> {
         let key_ref = self.find_key(key)?;
 
         match key_ref {
             None => Ok(None),
             Some(k) => Ok(Some(
-                &self.data[usize::from(k.offset)..usize::from(k.offset) + usize::from(k.len)],
+                &self.data[usize::from(k.value_offset)
+                    ..usize::from(k.value_offset) + usize::from(k.value_len)],
             )),
         }
-    }
-}
-
-impl Default for Node {
-    fn default() -> Self {
-        Node::new()
     }
 }
 
@@ -171,7 +196,8 @@ mod tests {
 
     #[test]
     fn mutate_and_read_header() -> Result<(), BTreeError> {
-        let mut node = Node::new();
+        let mut page = [0x00; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page)?;
 
         {
             let header_mut = node.mutate_header()?;
@@ -199,9 +225,18 @@ mod tests {
 
     #[test]
     fn insert_and_get() -> Result<(), BTreeError> {
-        let mut node = Node::new();
+        let mut page = [0x00; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page)?;
 
-        node.insert(0, b"abekat")?;
+        node.insert(0, b"0000")?;
+        node.insert(1, b"111")?;
+        node.insert(2, b"22")?;
+        node.insert(3, b"3")?;
+
+        assert_eq!(node.find_value(0)?.unwrap(), b"0000");
+        assert_eq!(node.find_value(1)?.unwrap(), b"111");
+        assert_eq!(node.find_value(2)?.unwrap(), b"22");
+        assert_eq!(node.find_value(3)?.unwrap(), b"3");
 
         Ok(())
     }
