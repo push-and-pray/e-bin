@@ -1,41 +1,16 @@
 use errors::BTreeError;
-use header::{Header, NodeType, HEADER_SIZE};
+use freeblock::{Freeblock, FREEBLOCK_SIZE};
+use header::{NodeType, HEADER_SIZE};
 use key::{Key, KEY_SIZE};
-use zerocopy::little_endian::U16;
-use zerocopy::{try_transmute_ref,try_transmute_mut, FromBytes, Immutable, IntoBytes, KnownLayout,};
+
+use zerocopy::IntoBytes;
 
 mod errors;
+mod freeblock;
 mod header;
 mod key;
 
 pub const PAGE_SIZE: u16 = 4096;
-
-
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable)]
-#[repr(C)]
-pub struct Freeblock {
-    next_freeblock: U16,
-    size: U16,
-}
-
-const FREEBLOCK_SIZE: u16 = {
-    if size_of::<Freeblock>() > u16::MAX as usize {
-        panic!("Freeblock size does not fit into u16");
-    }
-    size_of::<Freeblock>() as u16
-};
-
-impl Freeblock {
-    pub fn intepret_from_bytes(bytes: &[u8; FREEBLOCK_SIZE as usize]) -> Result<&Self, BTreeError> {
-        try_transmute_ref!(bytes).map_err(|err| BTreeError::SerializationError(err.to_string()))
-    }
-
-    pub fn intepret_mut_from_bytes(
-        bytes: &mut [u8; FREEBLOCK_SIZE as usize],
-    ) -> Result<&mut Self, BTreeError> {
-        try_transmute_mut!(bytes).map_err(|err| BTreeError::SerializationError(err.to_string()))
-    }
-}
 
 pub struct KeyValuePair {
     pub key: u64,
@@ -100,22 +75,6 @@ impl<'a> Node<'a> {
             self.page.len()
         );
         &mut self.page[offset..(offset + len)]
-    }
-
-    fn read_header(&self) -> Result<&Header, BTreeError> {
-        let header_bytes: &[u8; HEADER_SIZE as usize] = self
-            .get_page_slice(0, HEADER_SIZE as usize)
-            .try_into()
-            .expect("This should never fail, as the sizes are hardcoded to be the same");
-        Header::intepret_from_bytes(header_bytes)
-    }
-
-    fn mutate_header(&mut self) -> Result<&mut Header, BTreeError> {
-        let header_bytes: &mut [u8; HEADER_SIZE as usize] = self
-            .get_mut_page_slice(0, HEADER_SIZE as usize)
-            .try_into()
-            .expect("This should never fail, as the sizes are hardcoded to be the same");
-        Header::intepret_mut_from_bytes(header_bytes)
     }
 
     fn unallocated_space(&self) -> Result<u16, BTreeError> {
@@ -190,9 +149,16 @@ impl<'a> Node<'a> {
             }));
         }
 
-        todo!("Insert freeblock into linked list of freeblocks")
-    }
+        // Traverse freeblock to find suitable spot for new freeblock
+        let next_offset: u16 = self.read_header()?.first_freeblock.into();
+        let next_freeblock_bytes: &mut [u8; FREEBLOCK_SIZE as usize] = self
+            .get_mut_page_slice(next_offset.into(), FREEBLOCK_SIZE.into())
+            .try_into()
+            .expect("Shouldn't fail, sizes are hardcoded equal");
+        let next_freeblock = Freeblock::intepret_mut_from_bytes(next_freeblock_bytes)?;
 
+        todo!("");
+    }
 
     fn prepend_value(&mut self, value: &[u8]) -> Result<u16, BTreeError> {
         debug_assert!(self.unallocated_space()? as usize >= value.len());
@@ -209,136 +175,11 @@ impl<'a> Node<'a> {
         mut_header.free_end.set(new_free_end.try_into().unwrap());
         Ok(new_free_end as u16)
     }
-
-    // Inserts key obj at given idx, shifting others to the right. Assumes that there is space
-    // available in node
-    fn insert_key_at(&mut self, key: &Key, idx: u16) -> Result<(), BTreeError> {
-        debug_assert!(self.unallocated_space().unwrap() >= KEY_SIZE);
-
-        let header = self.read_header()?;
-        let keys_end = header.free_start.get() as usize;
-        let pos = self.get_key_pos(idx);
-
-        self.page
-            .copy_within(pos as usize..keys_end, (pos + KEY_SIZE).into());
-
-        self.get_mut_page_slice(pos as usize, KEY_SIZE as usize)
-            .copy_from_slice(Key::as_bytes(key));
-
-        let header = self.mutate_header()?;
-        header.free_start += KEY_SIZE;
-        header.num_keys += 1;
-
-        Ok(())
-    }
-
-    fn pop_key_from(&mut self, idx: u16) -> Result<Key, BTreeError> {
-        let key_pos = self.get_key_pos(idx);
-        debug_assert!(key_pos < self.read_header().unwrap().free_start.get());
-
-        let (key_ref, _offset) = self.get_key_at(idx)?;
-        let key = key_ref.clone();
-        let keys_end = self.read_header()?.free_start.get() as usize;
-
-        self.page.copy_within(
-            (key_pos + KEY_SIZE) as usize..keys_end,
-            key_pos as usize,
-        );
-
-        let header = self.mutate_header()?;
-        header.free_start -= KEY_SIZE;
-        header.num_keys -= 1;
-
-        Ok(key)
-    }
-
-    // Returns lowest index where key < other_key is true through binary search. Bool indicates if
-    // found index has key is equal to the key we are looking for
-    fn find_le_key_idx(&self, key: u64) -> Result<(usize, bool), BTreeError> {
-        let header = self.read_header()?;
-        let num_keys = header.num_keys.get();
-
-        if num_keys == 0 {
-            return Ok((0, false));
-        }
-
-        let mut low = 0;
-        let mut high = num_keys;
-
-        while low < high {
-            let mid = (low + high) / 2;
-            let (key_ptr, _offset) = self.get_key_at(mid)?;
-            let current_key = key_ptr.key.get();
-
-            // https://github.com/rust-lang/rust-clippy/issues/5354
-            #[allow(clippy::comparison_chain)]
-            if current_key == key {
-                return Ok((mid.into(), true));
-            } else if current_key < key {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-
-        Ok((low.into(), false))
-    }
-
-    fn get_key_pos(&self, index: u16) -> u16 {
-        HEADER_SIZE + KEY_SIZE * index
-    }
-
-    fn get_key_at(&self, index: u16) -> Result<(&Key, usize), BTreeError> {
-        let key_pos = self.get_key_pos(index) as usize;
-        let key_bytes: &[u8; KEY_SIZE as usize] = self.get_page_slice(key_pos, KEY_SIZE as usize).try_into().expect("Shouldn't fail, hardcoded");
-        Ok((
-            Key::intepret_from_bytes(key_bytes)?,
-            key_pos,
-        ))
-    }
-
-    fn get_mut_key_at(&mut self, index: u16) -> Result<(&mut Key, usize), BTreeError> {
-        let key_pos = self.get_key_pos(index) as usize;
-        let key_bytes: &mut [u8; KEY_SIZE as usize] = self.get_mut_page_slice(key_pos, KEY_SIZE as usize).try_into().expect("Shouldn't fail, hardcoded");
-        Ok((
-            Key::intepret_mut_from_bytes(key_bytes)?,
-            key_pos,
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mutate_and_read_header() -> Result<(), BTreeError> {
-        let mut page = [0x00; PAGE_SIZE as usize];
-        let mut node = Node::new(&mut page)?;
-
-        {
-            let header_mut = node.mutate_header()?;
-            header_mut.node_type = NodeType::Internal;
-            header_mut.num_keys.set(42);
-            header_mut.free_start.set(10);
-            header_mut.free_end.set(4);
-            header_mut.first_freeblock.set(5);
-            header_mut.fragmented_bytes = 2;
-            header_mut.rightmost_child_page.set(1234);
-        }
-
-        let header = node.read_header()?;
-
-        assert_eq!(header.node_type, NodeType::Internal);
-        assert_eq!(header.num_keys.get(), 42);
-        assert_eq!(header.free_start.get(), 10);
-        assert_eq!(header.free_end.get(), 4);
-        assert_eq!(header.first_freeblock.get(), 5);
-        assert_eq!(header.fragmented_bytes, 2);
-        assert_eq!(header.rightmost_child_page.get(), 1234);
-
-        Ok(())
-    }
 
     #[test]
     fn find_le_key() -> Result<(), BTreeError> {
