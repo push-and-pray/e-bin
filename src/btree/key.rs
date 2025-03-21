@@ -44,8 +44,16 @@ impl Key {
 }
 
 impl<'a> Node<'a> {
-    pub fn insert_key_at(&mut self, key: &Key, idx: u16) -> Result<(), BTreeError> {
+    pub fn insert_key_at(
+        &mut self,
+        idx: u16,
+        key: u64,
+        left_child_page: u32,
+        value_offset: u16,
+        value_len: u16,
+    ) -> Result<(), BTreeError> {
         debug_assert!(self.unallocated_space().unwrap() >= KEY_SIZE);
+        let key = Key::new(key, left_child_page, value_offset, value_len);
 
         let header = self.read_header()?;
         let keys_end = header.free_start.get() as usize;
@@ -55,7 +63,7 @@ impl<'a> Node<'a> {
             .copy_within(pos as usize..keys_end, (pos + KEY_SIZE).into());
 
         self.get_mut_page_slice(pos as usize, KEY_SIZE as usize)
-            .copy_from_slice(Key::as_bytes(key));
+            .copy_from_slice(key.as_bytes());
 
         let header = self.mutate_header()?;
         header.free_start += KEY_SIZE;
@@ -165,8 +173,7 @@ mod tests {
         let mut page = [0u8; PAGE_SIZE as usize];
         let mut node = Node::new(&mut page).unwrap();
 
-        let key = Key::new(123, 0, 100, 5);
-        node.insert_key_at(&key, 0).unwrap();
+        node.insert_key_at(0, 123, 0, 100, 5).unwrap();
 
         let (stored_key, _) = node.read_key_at(0).unwrap();
         assert_eq!(stored_key.key.get(), 123);
@@ -204,13 +211,9 @@ mod tests {
         let mut page = [0u8; PAGE_SIZE as usize];
         let mut node = Node::new(&mut page).unwrap();
 
-        let key1 = Key::new(10, 0, 100, 3);
-        let key2 = Key::new(30, 0, 200, 3);
-        let key3 = Key::new(20, 0, 150, 3);
-
-        node.insert_key_at(&key1, 0).unwrap();
-        node.insert_key_at(&key2, 1).unwrap();
-        node.insert_key_at(&key3, 1).unwrap();
+        node.insert_key_at(0, 10, 0, 100, 3).unwrap();
+        node.insert_key_at(1, 30, 0, 200, 3).unwrap();
+        node.insert_key_at(1, 20, 0, 150, 3).unwrap();
         let (first_key, _) = node.read_key_at(0).unwrap();
         let (second_key, _) = node.read_key_at(1).unwrap();
         let (third_key, _) = node.read_key_at(2).unwrap();

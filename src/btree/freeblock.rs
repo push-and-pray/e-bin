@@ -49,7 +49,7 @@ impl<'a> Node<'a> {
         Freeblock::intepret_mut_from_bytes(freeblock_bytes)
     }
 
-    pub fn write_freeblock(&mut self, size: u16, next_freeblock: u16, offset: usize) {
+    pub fn write_freeblock(&mut self, offset: usize, next_freeblock: u16, size: u16) {
         debug_assert!(
             offset >= self.read_header().unwrap().free_start.get().into(),
             "Tried writing freeblock before free space start"
@@ -119,7 +119,7 @@ mod tests {
         let expected_size = 123;
         let expected_next = 456;
 
-        node.write_freeblock(expected_size, expected_next, valid_offset);
+        node.write_freeblock(valid_offset, expected_next, expected_size);
         let freeblock = node
             .read_freeblock(valid_offset)
             .expect("Failed to read freeblock");
