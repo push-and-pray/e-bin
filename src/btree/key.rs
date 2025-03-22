@@ -76,7 +76,7 @@ impl<'a> Node<'a> {
         let key_pos = self.get_key_pos(idx);
         debug_assert!(key_pos < self.read_header().unwrap().free_start.get());
 
-        let (key_ref, _offset) = self.read_key_at(idx)?;
+        let key_ref = self.read_key_at(idx)?;
         let key = key_ref.clone();
         let keys_end = self.read_header()?.free_start.get() as usize;
 
@@ -103,7 +103,7 @@ impl<'a> Node<'a> {
 
         while low < high {
             let mid = (low + high) / 2;
-            let (key_ptr, _offset) = self.read_key_at(mid)?;
+            let key_ptr = self.read_key_at(mid)?;
             let current_key = key_ptr.key.get();
 
             // https://github.com/rust-lang/rust-clippy/issues/5354
@@ -124,13 +124,13 @@ impl<'a> Node<'a> {
         HEADER_SIZE + KEY_SIZE * index
     }
 
-    pub fn read_key_at(&self, index: u16) -> Result<(&Key, usize), BTreeError> {
+    pub fn read_key_at(&self, index: u16) -> Result<&Key, BTreeError> {
         let key_pos = self.get_key_pos(index) as usize;
         let key_bytes: &[u8; KEY_SIZE as usize] = self
             .get_page_slice(key_pos, KEY_SIZE as usize)
             .try_into()
             .expect("Shouldn't fail, hardcoded");
-        Ok((Key::intepret_from_bytes(key_bytes)?, key_pos))
+        Ok(Key::intepret_from_bytes(key_bytes)?)
     }
 
     fn mut_key_at(&mut self, index: u16) -> Result<(&mut Key, usize), BTreeError> {
@@ -175,7 +175,7 @@ mod tests {
 
         node.insert_key_at(0, 123, 0, 100, 5).unwrap();
 
-        let (stored_key, _) = node.read_key_at(0).unwrap();
+        let stored_key = node.read_key_at(0).unwrap();
         assert_eq!(stored_key.key.get(), 123);
         assert_eq!(stored_key.left_child_page.get(), 0);
         assert_eq!(stored_key.value_offset.get(), 100);
@@ -200,8 +200,8 @@ mod tests {
         let header = node.read_header().unwrap();
         assert_eq!(header.num_keys.get(), 2);
 
-        let (first_key, _) = node.read_key_at(0).unwrap();
-        let (second_key, _) = node.read_key_at(1).unwrap();
+        let first_key = node.read_key_at(0).unwrap();
+        let second_key = node.read_key_at(1).unwrap();
         assert_eq!(first_key.key.get(), 10);
         assert_eq!(second_key.key.get(), 30);
     }
@@ -214,9 +214,9 @@ mod tests {
         node.insert_key_at(0, 10, 0, 100, 3).unwrap();
         node.insert_key_at(1, 30, 0, 200, 3).unwrap();
         node.insert_key_at(1, 20, 0, 150, 3).unwrap();
-        let (first_key, _) = node.read_key_at(0).unwrap();
-        let (second_key, _) = node.read_key_at(1).unwrap();
-        let (third_key, _) = node.read_key_at(2).unwrap();
+        let first_key = node.read_key_at(0).unwrap();
+        let second_key = node.read_key_at(1).unwrap();
+        let third_key = node.read_key_at(2).unwrap();
 
         assert_eq!(first_key.key.get(), 10);
         assert_eq!(second_key.key.get(), 20);
