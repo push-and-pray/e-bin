@@ -1,7 +1,7 @@
 use errors::BTreeError;
 use freeblock::FREEBLOCK_SIZE;
 use header::{NodeType, HEADER_SIZE};
-use key::{Key, KEY_SIZE};
+use key::KEY_SIZE;
 
 mod errors;
 mod freeblock;
@@ -84,23 +84,42 @@ impl<'a> Node<'a> {
         Ok(total_space)
     }
 
-    pub fn insert(&mut self, key: u64, value: &[u8]) -> Result<(), BTreeError> {
+    pub fn get(&self, key: u64) -> Result<Option<KeyValuePair>, BTreeError> {
+        let (key_idx, exists) = self.find_le_key_idx(key)?;
+        if !exists {
+            return Ok(None);
+        }
+        
+        let key = self.read_key_at(key_idx.try_into().unwrap())?;
+        todo!();
+
+
+    }
+
+    pub fn insert(&mut self, key: u64, value: &[u8]) -> Result<Option<KeyValuePair>, BTreeError> {
         debug_assert!(value.len() < u16::MAX.into());
         let value_len = value.len() as u16;
-
-        if self.unallocated_space()? < (KEY_SIZE + value_len) {
-            todo!("Handle overflow and defrag");
-        }
 
         let (key_idx, exists) = self.find_le_key_idx(key)?;
 
         if exists {
-            todo!();
-        } else {
+            todo!("If exists, replace. Remember to check if there is enough space, if old val was removed")
+        }
+
+        if self.unallocated_space()? > KEY_SIZE + value_len {
             let offset = self.prepend_value(value)?;
             self.insert_key_at(key_idx.try_into().unwrap(), key, 0, offset, value_len)?;
+            return Ok(None);
         }
-        Ok(())
+
+        if self.free_space()? < KEY_SIZE + value_len {
+            return Err(BTreeError::NotEnoughSpace {
+                required: (KEY_SIZE + value_len).into(),
+                actual: self.free_space()?.into(),
+            });
+        }
+
+        todo!("At this point there is not enough unallocated space, but is enough free space. We have to check if there is space in a freeblock. if not, defrag")
     }
 
     pub fn delete(&mut self, key: u64) -> Result<Option<KeyValuePair>, BTreeError> {
@@ -108,8 +127,11 @@ impl<'a> Node<'a> {
         if !found {
             return Ok(None);
         }
+        Ok(Some(self.delete_at_idx(key_idx)?))
+    }
 
-        let deleted_key = self.pop_key_at(key_idx as u16)?;
+    fn delete_at_idx(&mut self, idx: usize) -> Result<KeyValuePair, BTreeError> {
+        let deleted_key = self.pop_key_at(idx as u16)?;
         let deleted_val = self
             .get_page_slice(
                 deleted_key.value_offset.get() as usize,
@@ -120,10 +142,10 @@ impl<'a> Node<'a> {
         // Value is at border. We dont have to care about freeblocks and just reclaim space
         if deleted_key.value_offset == self.read_header()?.free_end {
             self.mutate_header()?.free_end += deleted_key.value_len.get();
-            return Ok(Some(KeyValuePair {
+            return Ok(KeyValuePair {
                 key: deleted_key.key.get(),
                 value: deleted_val,
-            }));
+            });
         }
 
         if deleted_val.len() < FREEBLOCK_SIZE.into() {
@@ -131,10 +153,10 @@ impl<'a> Node<'a> {
             header.fragmented_bytes = header
                 .fragmented_bytes
                 .saturating_add(deleted_val.len() as u8);
-            return Ok(Some(KeyValuePair {
+            return Ok(KeyValuePair {
                 key: deleted_key.key.get(),
                 value: deleted_val,
-            }));
+            });
         }
 
         // Traverse freeblock chain until suitable location is found
@@ -160,10 +182,10 @@ impl<'a> Node<'a> {
             self.mutate_header()?.first_freeblock = deleted_key.value_offset;
         }
 
-        Ok(Some(KeyValuePair {
+        Ok(KeyValuePair {
             key: deleted_key.key.get(),
             value: deleted_val,
-        }))
+        })
     }
 
     fn prepend_value(&mut self, value: &[u8]) -> Result<u16, BTreeError> {
