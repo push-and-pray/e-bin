@@ -84,15 +84,14 @@ impl<'a> Node<'a> {
         Ok(total_space)
     }
 
-    pub fn get(&self, key: u64) -> Result<Option<KeyValuePair>, BTreeError> {
+    pub fn get(&self, key: u64) -> Result<Option<&[u8]>, BTreeError> {
         let (key_idx, exists) = self.find_le_key_idx(key)?;
         if !exists {
             return Ok(None);
         }
         
         let key = self.read_key_at(key_idx.try_into().unwrap())?;
-        todo!();
-
+        Ok(Some(self.get_page_slice(key.value_offset.get().into(), key.value_len.get().into())))
 
     }
 
@@ -278,5 +277,14 @@ mod tests {
         let free_end_after = node.read_header().unwrap().free_end.get();
         assert_eq!(free_end_after, free_end_before + 6);
         assert_eq!(deleted.value, b"border");
+    }
+
+    #[test]
+    fn test_get() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+        node.insert(1, b"abekat").unwrap();
+        assert_eq!(node.get(1).unwrap().unwrap(), b"abekat");
+        assert_eq!(node.get(2).unwrap(), None);
     }
 }
