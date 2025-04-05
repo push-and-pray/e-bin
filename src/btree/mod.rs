@@ -89,10 +89,53 @@ impl<'a> Node<'a> {
         if !exists {
             return Ok(None);
         }
-        
-        let key = self.read_key_at(key_idx.try_into().unwrap())?;
-        Ok(Some(self.get_page_slice(key.value_offset.get().into(), key.value_len.get().into())))
 
+        let key = self.read_key_at(key_idx.try_into().unwrap())?;
+        Ok(Some(self.get_page_slice(
+            key.value_offset.get().into(),
+            key.value_len.get().into(),
+        )))
+    }
+
+    pub fn defrag(&mut self) -> Result<(), BTreeError> {
+        let num_keys = { self.read_header()?.num_keys.get() };
+
+        let mut total_used = 0;
+        let mut key_infos = Vec::with_capacity(num_keys.into());
+        for i in 0..num_keys {
+            let key_record = self.read_key_at(i)?;
+            let val_len = key_record.value_len.get() as usize;
+            let old_offset = key_record.value_offset.get() as usize;
+            key_infos.push((i, old_offset, val_len));
+            total_used += val_len;
+        }
+
+        let mut buffer = vec![0u8; total_used];
+        let mut pos = 0;
+        for &(_idx, old_offset, val_len) in &key_infos {
+            let src_slice = self.get_page_slice(old_offset, val_len);
+            buffer[pos..pos + val_len].copy_from_slice(src_slice);
+            pos += val_len;
+        }
+
+        let new_free_end = PAGE_SIZE as usize - total_used;
+
+        self.get_mut_page_slice(new_free_end, total_used)
+            .copy_from_slice(&buffer);
+
+        pos = 0;
+        for &(idx, _old_offset, val_len) in &key_infos {
+            let key_record = self.mut_key_at(idx)?;
+            key_record.value_offset.set((new_free_end + pos) as u16);
+            pos += val_len;
+        }
+
+        let header = self.mutate_header()?;
+        header.free_end.set(new_free_end.try_into().unwrap());
+        header.first_freeblock.set(0);
+        header.fragmented_bytes = 0;
+
+        Ok(())
     }
 
     pub fn insert(&mut self, key: u64, value: &[u8]) -> Result<Option<KeyValuePair>, BTreeError> {
@@ -118,7 +161,84 @@ impl<'a> Node<'a> {
             });
         }
 
-        todo!("At this point there is not enough unallocated space, but is enough free space. We have to check if there is space in a freeblock. if not, defrag")
+        let mut prev_freeblock_offset: Option<u16> = None;
+        let mut current_freeblock_offset = self.read_header()?.first_freeblock.get();
+
+        while current_freeblock_offset != 0 {
+            let (freeblock_size, freeblock_next) = {
+                let freeblock = self.read_freeblock(current_freeblock_offset.into())?;
+                (freeblock.size.get(), freeblock.next_freeblock.get())
+            };
+
+            if freeblock_size < value_len {
+                prev_freeblock_offset = Some(current_freeblock_offset);
+                current_freeblock_offset = freeblock_next;
+                continue;
+            }
+            let chosen_offset = current_freeblock_offset;
+
+            if freeblock_size == value_len {
+                if let Some(prev) = prev_freeblock_offset {
+                    let prev_fb = self.mut_freeblock(prev.into())?;
+                    prev_fb.next_freeblock.set(freeblock_next);
+                } else {
+                    let header = self.mutate_header()?;
+                    header.first_freeblock.set(freeblock_next);
+                }
+            } else {
+                let remaining_size = freeblock_size - value_len;
+                if remaining_size < FREEBLOCK_SIZE {
+                    {
+                        let header = self.mutate_header()?;
+                        header.fragmented_bytes =
+                            header.fragmented_bytes.saturating_add(remaining_size as u8);
+                    }
+                    if let Some(prev) = prev_freeblock_offset {
+                        let prev_fb = self.mut_freeblock(prev.into())?;
+                        prev_fb.next_freeblock.set(freeblock_next);
+                    } else {
+                        let header = self.mutate_header()?;
+                        header.first_freeblock.set(freeblock_next);
+                    }
+                } else {
+                    let new_freeblock_offset = current_freeblock_offset + value_len;
+                    self.write_freeblock(
+                        new_freeblock_offset.into(),
+                        freeblock_next,
+                        remaining_size,
+                    );
+                    if let Some(prev) = prev_freeblock_offset {
+                        let prev_fb = self.mut_freeblock(prev.into())?;
+                        prev_fb.next_freeblock.set(new_freeblock_offset);
+                    } else {
+                        let header = self.mutate_header()?;
+                        header.first_freeblock.set(new_freeblock_offset);
+                    }
+                }
+            }
+
+            // Use the chosen freeblock space for the value.
+            self.get_mut_page_slice(chosen_offset as usize, value.len())
+                .copy_from_slice(value);
+            self.insert_key_at(
+                key_idx.try_into().unwrap(),
+                key,
+                0,
+                chosen_offset,
+                value_len,
+            )?;
+            return Ok(None);
+        }
+
+        self.defrag()?;
+
+        if self.unallocated_space()? > KEY_SIZE + value_len {
+            let offset = self.prepend_value(value)?;
+            self.insert_key_at(key_idx.try_into().unwrap(), key, 0, offset, value_len)?;
+            Ok(None)
+        } else {
+            panic!("Defragging didn't give back the required space. This should have been the case, as there was enough free space just before")
+        }
     }
 
     pub fn delete(&mut self, key: u64) -> Result<Option<KeyValuePair>, BTreeError> {
@@ -209,6 +329,117 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn test_load_node() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        {
+            let _node = Node::new(&mut page).unwrap();
+        }
+        let node = Node::load(&mut page).unwrap();
+        let header = node.read_header().unwrap();
+        assert_eq!(header.node_type, NodeType::Leaf);
+    }
+
+    #[test]
+    fn test_defrag_functionality() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        node.insert(10, b"value10").unwrap();
+        node.insert(20, b"value20").unwrap();
+        node.insert(30, b"value30").unwrap();
+
+        node.delete(20).unwrap();
+
+        let header_before = node.read_header().unwrap();
+        assert!(header_before.fragmented_bytes > 0 || header_before.first_freeblock.get() != 0);
+
+        node.defrag().unwrap();
+
+        let header_after = node.read_header().unwrap();
+        assert_eq!(header_after.fragmented_bytes, 0);
+        assert_eq!(header_after.first_freeblock.get(), 0);
+
+        assert_eq!(node.get(10).unwrap().unwrap(), b"value10");
+        assert_eq!(node.get(30).unwrap().unwrap(), b"value30");
+    }
+
+    #[test]
+    fn test_freeblock_reuse_in_insert() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        let large_value = vec![1u8; (FREEBLOCK_SIZE as usize) + 10];
+        node.insert(1, &large_value).unwrap();
+
+        let _ = node.delete(1).unwrap().unwrap();
+
+        let small_value = vec![2u8; 5];
+        node.insert(2, &small_value).unwrap();
+
+        let retrieved = node.get(2).unwrap().unwrap();
+        assert_eq!(retrieved, small_value.as_slice());
+    }
+
+    #[test]
+    fn test_out_of_order_insertion_and_deletion() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        node.insert(50, b"fifty").unwrap();
+        node.insert(20, b"twenty").unwrap();
+        node.insert(70, b"seventy").unwrap();
+        node.insert(10, b"ten").unwrap();
+        node.insert(40, b"forty").unwrap();
+
+        assert_eq!(node.get(10).unwrap().unwrap(), b"ten");
+        assert_eq!(node.get(20).unwrap().unwrap(), b"twenty");
+        assert_eq!(node.get(40).unwrap().unwrap(), b"forty");
+        assert_eq!(node.get(50).unwrap().unwrap(), b"fifty");
+        assert_eq!(node.get(70).unwrap().unwrap(), b"seventy");
+
+        let _ = node.delete(20).unwrap().unwrap();
+        let _ = node.delete(50).unwrap().unwrap();
+
+        assert!(node.get(20).unwrap().is_none());
+        assert!(node.get(50).unwrap().is_none());
+        assert_eq!(node.get(10).unwrap().unwrap(), b"ten");
+        assert_eq!(node.get(40).unwrap().unwrap(), b"forty");
+        assert_eq!(node.get(70).unwrap().unwrap(), b"seventy");
+    }
+
+    #[test]
+    fn test_complex_inserts_deletes() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        for key in 1..=20 {
+            let value = key.to_string().repeat((key % 5 + 3) as usize);
+            node.insert(key, value.as_bytes()).unwrap();
+        }
+
+        for key in (1..=20).filter(|k| k % 3 == 0) {
+            node.delete(key).unwrap();
+        }
+
+        for key in 21..=25 {
+            let value = format!("key{}", key);
+            node.insert(key, value.as_bytes()).unwrap();
+        }
+
+        for key in 1..=25 {
+            if key <= 20 && key % 3 == 0 {
+                assert!(node.get(key).unwrap().is_none());
+            } else if key <= 20 {
+                let expected = key.to_string().repeat((key % 5 + 3) as usize);
+                assert_eq!(node.get(key).unwrap().unwrap(), expected.as_bytes());
+            } else {
+                let expected = format!("key{}", key);
+                assert_eq!(node.get(key).unwrap().unwrap(), expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
     fn test_freespace_tracking() {
         let mut page = [0u8; PAGE_SIZE as usize];
         let mut node = Node::new(&mut page).unwrap();
@@ -286,5 +517,110 @@ mod tests {
         node.insert(1, b"abekat").unwrap();
         assert_eq!(node.get(1).unwrap().unwrap(), b"abekat");
         assert_eq!(node.get(2).unwrap(), None);
+    }
+
+    #[test]
+    fn test_defrag_with_multiple_freeblocks() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        // Insert and delete to create fragmentation
+        for i in 1..=5 {
+            let val: Vec<u8> = vec![i; 500];
+            node.insert(i.into(), &val).unwrap();
+        }
+        node.delete(2).unwrap();
+        node.delete(4).unwrap();
+
+        let pre_defrag_space = node.free_space().unwrap();
+        node.defrag().unwrap();
+        let post_defrag_space = node.free_space().unwrap();
+
+        assert_eq!(pre_defrag_space, post_defrag_space);
+        assert_eq!(node.read_header().unwrap().first_freeblock.get(), 0);
+    }
+
+    #[test]
+    fn test_reverse_order_insertion() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        for key in (1..=100).rev() {
+            node.insert(key, &key.to_le_bytes()).unwrap();
+        }
+
+        for key in 1u64..=100 {
+            let expected = key.to_le_bytes();
+            assert_eq!(node.get(key).unwrap().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_multiple_small_deletions_fragmented_bytes() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        node.insert(1, b"ab").unwrap(); // 2 bytes
+        node.insert(2, b"cd").unwrap(); // 2 bytes
+        node.insert(3, b"ef").unwrap(); // 2 bytes
+
+        let _ = node.delete(1).unwrap();
+        let _ = node.delete(2).unwrap();
+        let _ = node.delete(3).unwrap();
+
+        let header = node.read_header().unwrap();
+        assert_eq!(header.fragmented_bytes, 4);
+    }
+
+    #[test]
+    fn test_defrag_clears_fragmentation() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        node.insert(10, b"small").unwrap();
+        node.insert(20, b"tiny").unwrap();
+        let _ = node.delete(10).unwrap();
+        let _ = node.delete(20).unwrap();
+
+        let header_before = node.read_header().unwrap();
+        assert!(header_before.fragmented_bytes > 0 || header_before.first_freeblock.get() != 0);
+
+        node.defrag().unwrap();
+        let header_after = node.read_header().unwrap();
+        assert_eq!(header_after.fragmented_bytes, 0);
+        assert_eq!(header_after.first_freeblock.get(), 0);
+    }
+
+    #[test]
+    fn test_insert_using_freeblock_with_fragmentation() {
+        let mut page = [0u8; PAGE_SIZE as usize];
+        let mut node = Node::new(&mut page).unwrap();
+
+        {
+            let header = node.mutate_header().unwrap();
+            header.free_end.set(header.free_start.get() + 16);
+        }
+
+        let freeblock_offset = HEADER_SIZE + 50; // an arbitrary offset above free_start
+        let freeblock_size: u16 = 12;
+        {
+            let header = node.mutate_header().unwrap();
+            header.first_freeblock.set(freeblock_offset);
+        }
+        node.write_freeblock(freeblock_offset as usize, 0, freeblock_size);
+
+        let value = vec![b'a'; 10];
+        node.insert(101, &value).unwrap();
+
+        let key_record = node.read_key_at(0).unwrap();
+        assert_eq!(key_record.value_offset.get(), freeblock_offset);
+        assert_eq!(key_record.value_len.get(), 10);
+
+        let header = node.read_header().unwrap();
+        assert_eq!(header.fragmented_bytes, 2);
+        assert_eq!(header.first_freeblock.get(), 0);
+
+        let stored_value = node.get(101).unwrap().unwrap();
+        assert_eq!(stored_value, value.as_slice());
     }
 }

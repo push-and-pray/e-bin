@@ -74,11 +74,12 @@ impl<'a> Node<'a> {
 
     pub fn pop_key_at(&mut self, idx: u16) -> Result<Key, BTreeError> {
         let key_pos = self.get_key_pos(idx);
-        debug_assert!(key_pos < self.read_header().unwrap().free_start.get());
+        let old_header = self.read_header()?;
+        debug_assert!(key_pos < old_header.free_start.get());
 
         let key_ref = self.read_key_at(idx)?;
         let key = key_ref.clone();
-        let keys_end = self.read_header()?.free_start.get() as usize;
+        let keys_end = old_header.free_start.get() as usize;
 
         self.page
             .copy_within((key_pos + KEY_SIZE) as usize..keys_end, key_pos as usize);
@@ -133,13 +134,13 @@ impl<'a> Node<'a> {
         Ok(Key::intepret_from_bytes(key_bytes)?)
     }
 
-    fn mut_key_at(&mut self, index: u16) -> Result<(&mut Key, usize), BTreeError> {
+    pub fn mut_key_at(&mut self, index: u16) -> Result<&mut Key, BTreeError> {
         let key_pos = self.get_key_pos(index) as usize;
         let key_bytes: &mut [u8; KEY_SIZE as usize] = self
             .get_mut_page_slice(key_pos, KEY_SIZE as usize)
             .try_into()
             .expect("Shouldn't fail, hardcoded");
-        Ok((Key::intepret_mut_from_bytes(key_bytes)?, key_pos))
+        Ok(Key::intepret_mut_from_bytes(key_bytes)?)
     }
 }
 

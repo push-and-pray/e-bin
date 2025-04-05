@@ -82,6 +82,8 @@ impl<'a> Node<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::btree::freeblock::FREEBLOCK_SIZE;
+
     use super::super::header::HEADER_SIZE;
     use super::super::{Node, PAGE_SIZE};
     use super::*;
